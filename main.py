@@ -8,6 +8,15 @@ import datetime
 import time
 import traceback
 import threading
+import logging
+import signal
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"
+)
+logger = logging.getLogger("BeastX")
 
 import motor.motor_asyncio
 from pyrogram import Client, filters, enums
@@ -26,6 +35,22 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # =========================
 # BeastX Configuration
 # =========================
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+if os.path.exists(".env"):
+    with open(".env", "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                _k, _v = _k.strip(), _v.strip()
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+
 def required_env(name):
     value = os.environ.get(name, "").strip()
     if not value:
@@ -224,6 +249,54 @@ async def send_cancel(client: Client, message: Message):
         text="**Batch Successfully Cancelled.**"
     )
 
+def get_dump_chat():
+    if not CHANNEL_ID:
+        return None
+    raw = str(CHANNEL_ID).strip()
+    if not raw.startswith("-"):
+        if raw.startswith("100"):
+            raw = f"-{raw}"
+        else:
+            raw = f"-100{raw}"
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def build_clean_reply_markup(msg: Message):
+    if not msg or not msg.reply_markup:
+        return None
+    keyboard = getattr(msg.reply_markup, "inline_keyboard", None)
+    if not keyboard:
+        return None
+    
+    new_keyboard = []
+    for row in keyboard:
+        new_row = []
+        for btn in row:
+            text = (getattr(btn, "text", "") or "Link").strip()
+            url = getattr(btn, "url", None)
+            web_app = getattr(btn, "web_app", None)
+            
+            if url:
+                new_row.append(InlineKeyboardButton(text=text, url=url))
+            elif web_app and getattr(web_app, "url", None):
+                new_row.append(InlineKeyboardButton(text=text, web_app=web_app))
+            elif getattr(btn, "callback_data", None):
+                cb_data = btn.callback_data
+                if isinstance(cb_data, bytes):
+                    cb_data = cb_data.decode("utf-8", errors="ignore")
+                new_row.append(InlineKeyboardButton(text=text, callback_data=cb_data[:64]))
+        if new_row:
+            new_keyboard.append(new_row)
+            
+    if new_keyboard:
+        logger.info("Reconstructed clean inline keyboard with %d row(s) for attachment", len(new_keyboard))
+        return InlineKeyboardMarkup(new_keyboard)
+    return None
+
+
 @Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "login", "logout"]))
 async def save(client: Client, message: Message):
     # Joining chat
@@ -304,12 +377,22 @@ async def save(client: Client, message: Message):
                 except UsernameNotOccupied: 
                     await client.send_message(message.chat.id, "The username is not occupied by anyone", reply_to_message_id=message.id)
                     return
+                if not msg or msg.empty:
+                    logger.info("Public message ID %s is empty or deleted, skipping.", msgid)
+                    continue
+                dump_chat = get_dump_chat()
+                dest_chat = dump_chat if dump_chat else message.chat.id
+                reply_id = message.id if dest_chat == message.chat.id else None
+                clean_markup = build_clean_reply_markup(msg)
                 try:
-                    await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                except:
+                    await client.copy_message(dest_chat, msg.chat.id, msg.id, reply_to_message_id=reply_id, reply_markup=clean_markup)
+                    logger.info("Copied public message ID %s to chat %s with attached buttons", msgid, dest_chat)
+                except Exception as copy_err:
+                    logger.warning("copy_message failed for public message ID %s (%s), falling back to handle_private", msgid, copy_err)
                     try:    
                         await handle_private(client, acc, message, username, msgid)               
                     except Exception as e:
+                        logger.error("Error in handle_private for message ID %s: %s", msgid, e)
                         if ERROR_MESSAGE == True:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -325,43 +408,52 @@ async def save(client: Client, message: Message):
 
 # handle private
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+    logger.info("Processing message ID %s from chat %s for user %s", msgid, chatid, message.from_user.id)
     msg: Message = await acc.get_messages(chatid, msgid)
-    if msg.empty: return 
+    if msg.empty:
+        logger.warning("Message ID %s is empty or deleted", msgid)
+        return 
     msg_type = get_message_type(msg)
-    if not msg_type: return 
-    if CHANNEL_ID:
-        try:
-            chat = int(CHANNEL_ID)
-        except:
-            chat = message.chat.id
-    else:
-        chat = message.chat.id
+    if not msg_type:
+        logger.warning("Unknown message type for message ID %s", msgid)
+        return 
+    dump_chat = get_dump_chat()
+    chat = dump_chat if dump_chat else message.chat.id
+    reply_id = message.id if chat == message.chat.id else None
+    reply_markup = build_clean_reply_markup(msg)
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
     if "Text" == msg_type:
         try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
+            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+            logger.info("Sent text for message ID %s", msgid)
         except Exception as e:
+            if reply_markup:
+                try:
+                    await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=reply_id)
+                except:
+                    pass
+            logger.error("Error sending text for message ID %s: %s", msgid, e)
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
+        return
 
     smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
-    asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+    asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, message.chat.id))
     try:
+        logger.info("Downloading %s for message ID %s...", msg_type, msgid)
         file = await acc.download_media(msg, progress=progress, progress_args=[message,"down"])
         os.remove(f'{message.id}downstatus.txt')
+        logger.info("Finished downloading %s for message ID %s to %s", msg_type, msgid, file)
     except Exception as e:
+        logger.error("Download failed for message ID %s: %s", msgid, e)
         if ERROR_MESSAGE == True:
             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
         return await smsg.delete()
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
-    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
+    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, message.chat.id))
 
-    if msg.caption:
-        caption = msg.caption
-    else:
-        caption = None
+    caption = msg.caption if msg.caption else None
+    caption_entities = msg.caption_entities if msg.caption_entities else None
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
             
     if "Document" == msg_type:
@@ -371,7 +463,13 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             ph_path = None
         
         try:
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            try:
+                await client.send_document(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_document(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                else:
+                    raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
@@ -385,7 +483,13 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             ph_path = None
         
         try:
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            try:
+                await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                else:
+                    raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
@@ -393,21 +497,33 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     elif "Animation" == msg_type:
         try:
-            await client.send_animation(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            try:
+                await client.send_animation(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_animation(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id)
+                else:
+                    raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
         
     elif "Sticker" == msg_type:
         try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            await client.send_sticker(chat, file, reply_to_message_id=reply_id)
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)     
 
     elif "Voice" == msg_type:
         try:
-            await client.send_voice(chat, file, caption=caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            try:
+                await client.send_voice(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_voice(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                else:
+                    raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
@@ -419,7 +535,13 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             ph_path = None
 
         try:
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])   
+            try:
+                await client.send_audio(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_audio(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                else:
+                    raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
@@ -428,8 +550,14 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     elif "Photo" == msg_type:
         try:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except:
+            try:
+                await client.send_photo(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+            except Exception:
+                if reply_markup:
+                    await client.send_photo(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id)
+                else:
+                    raise
+        except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
     
@@ -437,6 +565,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         os.remove(f'{message.id}upstatus.txt')
         os.remove(file)
     await client.delete_messages(message.chat.id,[smsg.id])
+    logger.info("Upload complete and cleanup finished for message ID %s", msgid)
 
 
 # get the type of message
@@ -713,11 +842,11 @@ class Bot(Client):
 
     async def start(self, *args, **kwargs):
         await super().start(*args, **kwargs)
-        print("BeastX Bot Started | @Beastx_Bots | Dev @Godmrunal")
+        logger.info("BeastX Bot Started | @Beastx_Bots | Dev @Godmrunal")
 
     async def stop(self, *args):
         await super().stop()
-        print("BeastX Bot Stopped")
+        logger.info("BeastX Bot Stopped")
 
 
 HEALTH_PORT = int(os.environ.get("PORT", 8000))
@@ -738,7 +867,7 @@ def _start_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print("Health check server listening on port %s", HEALTH_PORT)
+    logger.info("Health check server listening on port %s", HEALTH_PORT)
 
 
 
@@ -746,6 +875,20 @@ def _start_health_server():
 
 if __name__ == "__main__":
     bot = Bot()
+
+    def sigint_handler(sig, frame):
+        logger.info("Received signal %s (SIGINT / Ctrl+C). Shutting down cleanly...", sig)
+        try:
+            if bot.is_connected:
+                asyncio.run(bot.stop())
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, sigint_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, sigint_handler)
+
     _start_health_server()
     # Register every command explicitly on the actual Bot instance.
     # The project was consolidated into one file, so decorators attached to
@@ -779,4 +922,7 @@ if __name__ == "__main__":
         filters.command(["broadcast"]) & filters.user(ADMINS)
     ))
 
-    bot.run()
+    try:
+        bot.run()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("BeastX Bot stopped cleanly.")
