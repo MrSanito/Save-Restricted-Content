@@ -300,32 +300,61 @@ def build_clean_reply_markup(msg: Message):
 @Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "login", "logout"]))
 async def save(client: Client, message: Message):
     # Joining chat
-    if ("https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text) and LOGIN_SYSTEM == False:
-        if BeastXUser is None:
-            await client.send_message(message.chat.id, "String Session is not Set", reply_to_message_id=message.id)
-            return
+    if "https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text:
+        target_acc = None
+        if LOGIN_SYSTEM == False:
+            if BeastXUser is None:
+                await client.send_message(message.chat.id, "String Session is not Set", reply_to_message_id=message.id)
+                return
+            target_acc = BeastXUser
+        else:
+            user_data = await db.get_session(message.from_user.id)
+            if user_data is None:
+                await message.reply("**For Joining Chat You Have To /login First.**")
+                return
+            api_id = int(await db.get_api_id(message.from_user.id))
+            api_hash = await db.get_api_hash(message.from_user.id)
+            try:
+                target_acc = Client("saverestricted_join", session_string=user_data, api_hash=api_hash, api_id=api_id)
+                await target_acc.connect()
+            except Exception as e:
+                return await message.reply(f"**Session error: {e}**")
         try:
             try:
-                await BeastXUser.join_chat(message.text)
+                await target_acc.join_chat(message.text.strip())
+            except UserAlreadyParticipant:
+                await client.send_message(message.chat.id, "Chat already Joined", reply_to_message_id=message.id)
+                return
+            except InviteHashExpired:
+                await client.send_message(message.chat.id, "Invalid or Expired Link", reply_to_message_id=message.id)
+                return
             except Exception as e: 
                 await client.send_message(message.chat.id, f"Error : {e}", reply_to_message_id=message.id)
                 return
-            await client.send_message(message.chat.id, "Chat Joined", reply_to_message_id=message.id)
-        except UserAlreadyParticipant:
-            await client.send_message(message.chat.id, "Chat already Joined", reply_to_message_id=message.id)
-        except InviteHashExpired:
-            await client.send_message(message.chat.id, "Invalid Link", reply_to_message_id=message.id)
+            await client.send_message(message.chat.id, "Chat Joined Successfully!", reply_to_message_id=message.id)
+        finally:
+            if LOGIN_SYSTEM == True and target_acc:
+                try:
+                    await target_acc.disconnect()
+                except Exception:
+                    pass
         return
     
     if "https://t.me/" in message.text:
         if batch_temp.IS_BATCH.get(message.from_user.id) == False:
             return await message.reply_text("**One Task Is Already Processing. Wait For Complete It. If You Want To Cancel This Task Then Use - /cancel**")
-        datas = message.text.split("/")
-        temp = datas[-1].replace("?single","").split("-")
-        fromID = int(temp[0].strip())
+        
+        cleaned_text = message.text.strip().rstrip("/")
+        datas = cleaned_text.split("/")
+        last_seg = datas[-1].split("?")[0].split("#")[0]
+        temp = last_seg.split("-")
+        try:
+            fromID = int(temp[0].strip())
+        except ValueError:
+            return await message.reply_text("**Invalid message link format.**")
         try:
             toID = int(temp[1].strip())
-        except:
+        except Exception:
             toID = fromID
 
         if LOGIN_SYSTEM == True:
@@ -338,7 +367,7 @@ async def save(client: Client, message: Message):
             try:
                 acc = Client("saverestricted", session_string=user_data, api_hash=api_hash, api_id=api_id)
                 await acc.connect()
-            except:
+            except Exception:
                 return await message.reply("**Your Login Session Expired. So /logout First Then Login Again By - /login**")
         else:
             if BeastXUser is None:
@@ -352,7 +381,13 @@ async def save(client: Client, message: Message):
             
             # private
             if "https://t.me/c/" in message.text:
-                chatid = int("-100" + datas[4])
+                raw_chat = datas[4].strip()
+                if raw_chat.startswith("-100"):
+                    chatid = int(raw_chat)
+                elif raw_chat.startswith("-"):
+                    chatid = int("-100" + raw_chat.lstrip("-"))
+                else:
+                    chatid = int("-100" + raw_chat)
                 try:
                     await handle_private(client, acc, message, chatid, msgid)
                 except Exception as e:
@@ -361,7 +396,7 @@ async def save(client: Client, message: Message):
     
             # bot
             elif "https://t.me/b/" in message.text:
-                username = datas[4]
+                username = datas[4].strip()
                 try:
                     await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
@@ -370,7 +405,7 @@ async def save(client: Client, message: Message):
             
             # public
             else:
-                username = datas[3]
+                username = datas[3].strip()
 
                 try:
                     msg = await client.get_messages(username, msgid)
@@ -388,6 +423,15 @@ async def save(client: Client, message: Message):
                     await client.copy_message(dest_chat, msg.chat.id, msg.id, reply_to_message_id=reply_id, reply_markup=clean_markup)
                     logger.info("Copied public message ID %s to chat %s with attached buttons", msgid, dest_chat)
                 except Exception as copy_err:
+                    copy_err_str = str(copy_err)
+                    if dump_chat and dest_chat == dump_chat and any(k in copy_err_str for k in ["CHANNEL_INVALID", "ChannelInvalid", "CHAT_WRITE_FORBIDDEN"]):
+                        logger.warning("Dump channel %s failed (%s). Copying directly to user chat...", dest_chat, copy_err)
+                        try:
+                            await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id, reply_markup=clean_markup)
+                            await client.send_message(message.chat.id, "⚠️ **Notice:** Bot could not post in Dump Channel (Bot lacks Admin permissions). Delivered directly here.")
+                            continue
+                        except Exception:
+                            pass
                     logger.warning("copy_message failed for public message ID %s (%s), falling back to handle_private", msgid, copy_err)
                     try:    
                         await handle_private(client, acc, message, username, msgid)               
@@ -401,36 +445,78 @@ async def save(client: Client, message: Message):
         if LOGIN_SYSTEM == True:
             try:
                 await acc.disconnect()
-            except:
+            except Exception:
                 pass                				
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
+async def get_message_with_cache(acc: Client, chatid, msgid: int) -> Message:
+    try:
+        return await acc.get_messages(chatid, msgid)
+    except Exception as e:
+        err_str = str(e)
+        if "CHANNEL_INVALID" in err_str or "ChannelInvalid" in type(e).__name__:
+            logger.info("Channel %s not resolved in session cache. Warming up dialogs to load peer access_hash...", chatid)
+            found = False
+            try:
+                async for dialog in acc.get_dialogs(limit=250):
+                    if dialog.chat and (dialog.chat.id == chatid or getattr(dialog.chat, "username", None) == chatid):
+                        found = True
+                        break
+            except Exception as d_err:
+                logger.warning("Dialogs warmup error: %s", d_err)
+            
+            try:
+                return await acc.get_messages(chatid, msgid)
+            except Exception as retry_err:
+                if not found:
+                    raise Exception(f"Source Channel Error: Your logged-in Telegram account has NOT joined this channel/group ({chatid}). Please join it first using the Telegram account logged into the bot.")
+                raise Exception(f"Source Channel Error: Telegram could not fetch message {msgid} from channel {chatid} ({retry_err})")
+        raise Exception(f"Source Channel Error: {e}")
+
+
 # handle private
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+async def handle_private(client: Client, acc, message: Message, chatid, msgid: int):
     logger.info("Processing message ID %s from chat %s for user %s", msgid, chatid, message.from_user.id)
-    msg: Message = await acc.get_messages(chatid, msgid)
-    if msg.empty:
+    msg: Message = await get_message_with_cache(acc, chatid, msgid)
+    if not msg or msg.empty:
         logger.warning("Message ID %s is empty or deleted", msgid)
         return 
     msg_type = get_message_type(msg)
     if not msg_type:
         logger.warning("Unknown message type for message ID %s", msgid)
         return 
+    
     dump_chat = get_dump_chat()
-    chat = dump_chat if dump_chat else message.chat.id
-    reply_id = message.id if chat == message.chat.id else None
     reply_markup = build_clean_reply_markup(msg)
     if batch_temp.IS_BATCH.get(message.from_user.id): return 
+
+    async def try_send(send_func, *args, **kwargs):
+        primary_chat = dump_chat if dump_chat else message.chat.id
+        reply_to_id = message.id if primary_chat == message.chat.id else None
+        try:
+            return await send_func(primary_chat, *args, reply_to_message_id=reply_to_id, **kwargs)
+        except Exception as primary_err:
+            primary_err_str = str(primary_err)
+            if dump_chat and primary_chat == dump_chat and any(k in primary_err_str for k in ["CHANNEL_INVALID", "ChannelInvalid", "CHAT_WRITE_FORBIDDEN", "USER_BANNED_IN_CHANNEL", "ChatWriteForbidden"]):
+                logger.warning("Dump channel %s failed (%s). Falling back to user chat %s...", dump_chat, primary_err, message.chat.id)
+                res = await send_func(message.chat.id, *args, reply_to_message_id=message.id, **kwargs)
+                try:
+                    await client.send_message(message.chat.id, "⚠️ **Notice:** Bot could not post in the configured Dump Channel (Bot lacks Admin permissions). Delivered directly here instead.")
+                except Exception:
+                    pass
+                return res
+            raise primary_err
+
     if "Text" == msg_type:
         try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+            await try_send(client.send_message, msg.text, entities=msg.entities, reply_markup=reply_markup)
             logger.info("Sent text for message ID %s", msgid)
         except Exception as e:
             if reply_markup:
                 try:
-                    await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=reply_id)
-                except:
+                    await try_send(client.send_message, msg.text, entities=msg.entities)
+                except Exception:
                     pass
             logger.error("Error sending text for message ID %s: %s", msgid, e)
             if ERROR_MESSAGE == True:
@@ -442,66 +528,74 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     try:
         logger.info("Downloading %s for message ID %s...", msg_type, msgid)
         file = await acc.download_media(msg, progress=progress, progress_args=[message,"down"])
-        os.remove(f'{message.id}downstatus.txt')
+        if os.path.exists(f'{message.id}downstatus.txt'):
+            os.remove(f'{message.id}downstatus.txt')
         logger.info("Finished downloading %s for message ID %s to %s", msg_type, msgid, file)
     except Exception as e:
         logger.error("Download failed for message ID %s: %s", msgid, e)
+        if os.path.exists(f'{message.id}downstatus.txt'):
+            os.remove(f'{message.id}downstatus.txt')
         if ERROR_MESSAGE == True:
             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
         return await smsg.delete()
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    if batch_temp.IS_BATCH.get(message.from_user.id): 
+        if os.path.exists(file): os.remove(file)
+        return 
     asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, message.chat.id))
 
     caption = msg.caption if msg.caption else None
     caption_entities = msg.caption_entities if msg.caption_entities else None
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    if batch_temp.IS_BATCH.get(message.from_user.id): 
+        if os.path.exists(file): os.remove(file)
+        return 
             
     if "Document" == msg_type:
         try:
             ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-        except:
+        except Exception:
             ph_path = None
         
         try:
             try:
-                await client.send_document(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+                await try_send(client.send_document, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_document(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                    await try_send(client.send_document, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"])
                 else:
                     raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-        
+        if ph_path and os.path.exists(ph_path): 
+            os.remove(ph_path)
 
     elif "Video" == msg_type:
         try:
             ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-        except:
+        except Exception:
             ph_path = None
         
         try:
             try:
-                await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+                await try_send(client.send_video, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                    await try_send(client.send_video, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"])
                 else:
                     raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
+        if ph_path and os.path.exists(ph_path): 
+            os.remove(ph_path)
 
     elif "Animation" == msg_type:
         try:
             try:
-                await client.send_animation(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+                await try_send(client.send_animation, file, caption=caption, caption_entities=caption_entities, reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_animation(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id)
+                    await try_send(client.send_animation, file, caption=caption, caption_entities=caption_entities)
                 else:
                     raise
         except Exception as e:
@@ -510,7 +604,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         
     elif "Sticker" == msg_type:
         try:
-            await client.send_sticker(chat, file, reply_to_message_id=reply_id)
+            await try_send(client.send_sticker, file)
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)     
@@ -518,10 +612,10 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     elif "Voice" == msg_type:
         try:
             try:
-                await client.send_voice(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+                await try_send(client.send_voice, file, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_voice(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                    await try_send(client.send_voice, file, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"])
                 else:
                     raise
         except Exception as e:
@@ -531,30 +625,31 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     elif "Audio" == msg_type:
         try:
             ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-        except:
+        except Exception:
             ph_path = None
 
         try:
             try:
-                await client.send_audio(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
+                await try_send(client.send_audio, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"], reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_audio(chat, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, progress=progress, progress_args=[message,"up"])
+                    await try_send(client.send_audio, file, thumb=ph_path, caption=caption, caption_entities=caption_entities, progress=progress, progress_args=[message,"up"])
                 else:
                     raise
         except Exception as e:
             if ERROR_MESSAGE == True:
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
         
-        if ph_path != None: os.remove(ph_path)
+        if ph_path and os.path.exists(ph_path): 
+            os.remove(ph_path)
 
     elif "Photo" == msg_type:
         try:
             try:
-                await client.send_photo(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id, reply_markup=reply_markup)
+                await try_send(client.send_photo, file, caption=caption, caption_entities=caption_entities, reply_markup=reply_markup)
             except Exception:
                 if reply_markup:
-                    await client.send_photo(chat, file, caption=caption, caption_entities=caption_entities, reply_to_message_id=reply_id)
+                    await try_send(client.send_photo, file, caption=caption, caption_entities=caption_entities)
                 else:
                     raise
         except Exception as e:
@@ -563,8 +658,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     if os.path.exists(f'{message.id}upstatus.txt'): 
         os.remove(f'{message.id}upstatus.txt')
+    if os.path.exists(file): 
         os.remove(file)
-    await client.delete_messages(message.chat.id,[smsg.id])
+    try:
+        await client.delete_messages(message.chat.id, [smsg.id])
+    except Exception:
+        pass
     logger.info("Upload complete and cleanup finished for message ID %s", msgid)
 
 
