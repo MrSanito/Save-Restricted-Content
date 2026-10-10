@@ -20,6 +20,11 @@ logger = logging.getLogger("BeastX")
 
 import motor.motor_asyncio
 from pyrogram import Client, filters, enums
+from pyrogram.session import Session
+
+# Increase timeout and retries for stable chunk downloading
+Session.WAIT_TIMEOUT = 35
+Session.MAX_RETRIES = 20
 from pyrogram.handlers import MessageHandler
 from pyrogram.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant,
